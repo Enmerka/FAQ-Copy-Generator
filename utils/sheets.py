@@ -1,0 +1,119 @@
+import gspread
+import gspread.utils
+import pandas as pd
+from google.oauth2.service_account import Credentials
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+
+def get_gspread_client(sa_info: dict) -> gspread.Client:
+    creds = Credentials.from_service_account_info(sa_info, scopes=SCOPES)
+    return gspread.authorize(creds)
+
+
+def load_sheet(gc: gspread.Client, sheet_url: str, worksheet_name: str = None):
+    spreadsheet = gc.open_by_url(sheet_url)
+    if worksheet_name:
+        ws = spreadsheet.worksheet(worksheet_name)
+    else:
+        ws = spreadsheet.get_worksheet(0)
+
+    all_values = ws.get_all_values()
+    if not all_values:
+        return pd.DataFrame(), spreadsheet, ws
+
+    # Build headers: replace empty cells with a placeholder so pandas
+    # doesn't complain, and deduplicate any repeated names
+    raw_headers = all_values[0]
+    seen = {}
+    headers = []
+    for i, h in enumerate(raw_headers):
+        h = h.strip() if h.strip() else f"_col_{i}"
+        if h in seen:
+            seen[h] += 1
+            h = f"{h}_{seen[h]}"
+        else:
+            seen[h] = 0
+        headers.append(h)
+
+    rows = all_values[1:]
+    # Pad short rows so every row has the same number of columns
+    n_cols = len(headers)
+    rows = [r + [""] * (n_cols - len(r)) for r in rows]
+
+    df = pd.DataFrame(rows, columns=headers)
+    return df, spreadsheet, ws
+
+
+def write_results_to_sheet(ws, results_df: pd.DataFrame, col_map: dict):
+    """Batch write results back to sheet using values_batch_update.
+    col_map: {results_df_column_name: sheet_header_name}
+    Never writes cell-by-cell.
+    """
+    headers = ws.row_values(1)
+
+    col_indices = {}
+    for df_col, sheet_col in col_map.items():
+        if sheet_col in headers:
+            col_indices[df_col] = headers.index(sheet_col) + 1
+        else:
+            new_idx = len(headers) + 1
+            ws.update_cell(1, new_idx, sheet_col)
+            headers.append(sheet_col)
+            col_indices[df_col] = new_idx
+
+    # Expand the sheet if the required columns exceed the current grid width
+    max_col_needed = max(col_indices.values()) if col_indices else 0
+    max_row_needed = len(results_df) + 1  # +1 for header
+    sheet_meta = ws.spreadsheet.fetch_sheet_metadata()
+    for s in sheet_meta["sheets"]:
+        if s["properties"]["title"] == ws.title:
+            current_cols = s["properties"]["gridProperties"]["columnCount"]
+            current_rows = s["properties"]["gridProperties"]["rowCount"]
+            break
+    else:
+        current_cols, current_rows = 26, 1000
+
+    requests_body = []
+    if max_col_needed > current_cols:
+        requests_body.append({
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws.id,
+                    "gridProperties": {"columnCount": max_col_needed + 10}
+                },
+                "fields": "gridProperties.columnCount"
+            }
+        })
+    if max_row_needed > current_rows:
+        requests_body.append({
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": ws.id,
+                    "gridProperties": {"rowCount": max_row_needed + 50}
+                },
+                "fields": "gridProperties.rowCount"
+            }
+        })
+    if requests_body:
+        ws.spreadsheet.batch_update({"requests": requests_body})
+
+    updates = []
+    for row_num, (_, row) in enumerate(results_df.iterrows(), start=2):
+        for df_col, col_idx in col_indices.items():
+            val = row.get(df_col, "")
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                val = ""
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(row_num, col_idx),
+                "values": [[str(val)]]
+            })
+
+    if updates:
+        ws.spreadsheet.values_batch_update({
+            "valueInputOption": "RAW",
+            "data": updates
+        })
